@@ -446,148 +446,17 @@ class MAPPOPolicy(object):
         state_dict = {
             "critic": self.critic.state_dict(),
             "actor_params": self.actor_params,
+            "value_normalizer": self.value_normalizer.state_dict(),
         }
-        if hasattr(self, "value_normalizer"):
-            state_dict["value_normalizer"] = self.value_normalizer.state_dict()
         return state_dict
 
     def load_state_dict(self, state_dict):
-        def _fit_loaded_tensor(cur: torch.Tensor, old: torch.Tensor) -> Optional[torch.Tensor]:
-            old = old.to(cur.device, cur.dtype)
-            if cur.shape == old.shape:
-                return old
-
-            # Try shape candidates by removing leading singleton/share dims from checkpoint,
-            # then re-adding leading singleton dims to align rank with current tensor.
-            candidates = [old]
-            squeezed = old
-            while squeezed.ndim > 0 and squeezed.shape[0] == 1:
-                squeezed = squeezed.squeeze(0)
-                candidates.append(squeezed)
-
-            for cand in candidates:
-                aligned = cand
-                while aligned.ndim < cur.ndim:
-                    aligned = aligned.unsqueeze(0)
-                while aligned.ndim > cur.ndim and aligned.shape[0] == 1:
-                    aligned = aligned.squeeze(0)
-                if aligned.ndim != cur.ndim:
-                    continue
-
-                if aligned.shape == cur.shape:
-                    return aligned
-
-                # Non-last dimensions must either match or be broadcastable singleton.
-                non_last_ok = all(
-                    old_dim == cur_dim or old_dim == 1
-                    for old_dim, cur_dim in zip(aligned.shape[:-1], cur.shape[:-1])
-                )
-                if not non_last_ok:
-                    continue
-
-                old_last = aligned.shape[-1]
-                cur_last = cur.shape[-1]
-                if old_last > cur_last:
-                    continue
-
-                expand_shape = [
-                    cur_dim if old_dim == 1 else old_dim
-                    for old_dim, cur_dim in zip(aligned.shape[:-1], cur.shape[:-1])
-                ] + [old_last]
-                expanded = aligned.expand(*expand_shape)
-
-                if old_last == cur_last:
-                    return expanded.clone()
-
-                padded = torch.zeros_like(cur)
-                padded[..., :old_last] = expanded
-                return padded
-
-            return None
-
-        def _shape_safe_load_tensor_dict_params(
-            current_params, loaded_params, name="actor_params"
-        ):
-            current_td = current_params.to_tensordict()
-            loaded_td = (
-                loaded_params.to_tensordict()
-                if hasattr(loaded_params, "to_tensordict")
-                else loaded_params
-            )
-            loaded_keys = set(loaded_td.keys(True, True))
-
-            loaded_count = 0
-            skipped = []
-
-            for key in current_td.keys(True, True):
-                if key not in loaded_keys:
-                    skipped.append((key, "missing"))
-                    continue
-
-                cur = current_td.get(key)
-                old = loaded_td.get(key)
-
-                fitted = _fit_loaded_tensor(cur, old)
-                if fitted is None:
-                    skipped.append((key, (tuple(old.shape), tuple(cur.shape))))
-                    continue
-
-                current_td.set(key, fitted)
-                loaded_count += 1
-
-            new_params = TensorDictParams(current_td)
-            print(
-                f"[Checkpoint] {name}: loaded {loaded_count} tensors, skipped {len(skipped)}"
-            )
-            if skipped:
-                print(f"[Checkpoint] {name} skipped examples: {skipped[:10]}")
-            return new_params
-
-        def _shape_safe_load_module(module, loaded_sd, name="critic"):
-            current_sd = module.state_dict()
-            loaded_count = 0
-            skipped = []
-
-            for k, cur in current_sd.items():
-                if k not in loaded_sd:
-                    skipped.append((k, "missing"))
-                    continue
-
-                old = loaded_sd[k]
-
-                fitted = _fit_loaded_tensor(cur, old)
-                if fitted is None:
-                    skipped.append((k, (tuple(old.shape), tuple(cur.shape))))
-                    continue
-
-                current_sd[k] = fitted
-                loaded_count += 1
-
-            module.load_state_dict(current_sd, strict=False)
-            print(
-                f"[Checkpoint] {name}: loaded {loaded_count} tensors, skipped {len(skipped)}"
-            )
-            if skipped:
-                print(f"[Checkpoint] {name} skipped examples: {skipped[:10]}")
-
-        # actor params
-        self.actor_params = _shape_safe_load_tensor_dict_params(
-            self.actor_params, state_dict["actor_params"], name="actor_params"
-        )
+        self.actor_params = state_dict["actor_params"]
         self.actor_opt = torch.optim.Adam(
             self.actor_params.parameters(), lr=self.cfg.actor.lr
         )
-
-        # critic
-        _shape_safe_load_module(self.critic, state_dict["critic"], name="critic")
-
-        # value normalizer usually matches; if not, skip safely
-        if "value_normalizer" in state_dict:
-            try:
-                self.value_normalizer.load_state_dict(state_dict["value_normalizer"])
-                print("[Checkpoint] value_normalizer loaded")
-            except Exception as e:
-                print(f"[Checkpoint] value_normalizer skipped: {e}")
+        self.critic.load_state_dict(state_dict["critic"])
+        self.value_normalizer.load_state_dict(state_dict["value_normalizer"])
 
     def eval(self):
         self.actor.eval()
